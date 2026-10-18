@@ -12,6 +12,17 @@ _(Work toward next release. Currently under development.)_
 * Added the ability to specify additional arguments to pass to uWSGI via
   `cs_extra_uwsgi_options`
 
+* Added a course-wide instructor analytics dashboard (`?action=analytics`,
+  requires the `whdw` permission) showing per-assignment averages, progress,
+  and score distributions, per-question statistics, a per-student score table
+  with at-risk flagging, late-submission counts, and CSV export.  Pages can be
+  grouped with `cs_assignment_category` (e.g. homework, labs, exams; set it in
+  a folder's `preload.py` to apply it to every page below), and
+  `cs_analytics_category_weights` makes overall scores a weighted average of
+  category averages.  Only assignments past their due date count toward
+  overall scores, and work awaiting a grade is left out until graded.  Also configurable via `cs_analytics_student_roles` and
+  `cs_analytics_at_risk_threshold`.
+
 **CHANGED**
 
 * Improved error messages in the `list_users` API endpoint
@@ -34,6 +45,13 @@ _(Work toward next release. Currently under development.)_
   `cs_auto_lock = True` is set
 
 * Fixed `fileupload` question type so that it respects `cs_upload_management`
+
+* Fixed the `whdw` and `stats` pages showing no students when viewed by staff
+  without a section in a course whose students all have sections; they now
+  default to all sections, and accept `section=all`
+
+* Fixed `catsoop.tutor.compute_page_stats` reporting the literal string
+  `'csq_name'` as the display name of questions without a `csq_display_name`
 
 **SECURITY**
 

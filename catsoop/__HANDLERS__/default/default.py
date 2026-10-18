@@ -26,6 +26,9 @@ import string
 import hashlib
 import binascii
 import traceback
+import io
+import csv
+import urllib.parse
 import collections
 import collections.abc
 
@@ -118,6 +121,7 @@ def handle(context):
         "render_single_question": handle_single_question,
         "stats": handle_stats,
         "whdw": handle_whdw,
+        "analytics": handle_analytics,
         "new_seed": handle_new_seed,
     }
 
@@ -2244,6 +2248,7 @@ def pre_handle(context):
         "get_state",
         "manage_groups",
         "render_single_question",
+        "analytics",
     ):
         context[_n("form")] = context["cs_form"]
     else:
@@ -2372,7 +2377,7 @@ def exc_message(context):
 def _get_scores(context):
     section = str(
         context.get("cs_form", {}).get(
-            "section", context.get("cs_user_info").get("section", "default")
+            "section", context.get("cs_user_info").get("section", "all")
         )
     )
 
@@ -2383,7 +2388,7 @@ def _get_scores(context):
         user.read_user_file(context, context["cs_course"], username, {})
         for username in usernames
     ]
-    no_section = context.get("cs_whdw_no_section", False)
+    no_section = context.get("cs_whdw_no_section", False) or section == "all"
     students = [
         user
         for user in users
@@ -2425,7 +2430,7 @@ def handle_stats(context):
 
     section = str(
         context.get("cs_form", {}).get(
-            "section", context.get("cs_user_info").get("section", "default")
+            "section", context.get("cs_user_info").get("section", "all")
         )
     )
 
@@ -2511,6 +2516,409 @@ def handle_stats(context):
     return str(soup)
 
 
+ANALYTICS_CSS = """
+<style>
+.cs-analytics { text-align: left; }
+.cs-analytics h2 { margin-top: 1.5em; }
+.cs-analytics .an-controls { display: flex; flex-wrap: wrap; gap: 1em; align-items: center; }
+.cs-analytics .an-cards { display: flex; flex-wrap: wrap; gap: 1em; margin: 1em 0; }
+.cs-analytics .an-card { flex: 1 1 10em; border: 1px solid #ccc; border-radius: 6px; padding: 0.75em 1em; }
+.cs-analytics .an-card .an-label { font-size: 0.85em; opacity: 0.75; }
+.cs-analytics .an-card .an-value { font-size: 1.8em; font-weight: bold; }
+.cs-analytics .an-scroll { overflow-x: auto; }
+.cs-analytics table { width: 100%; border: 1px solid #ccc; }
+.cs-analytics th, .cs-analytics td { border: 1px solid #ccc; padding: 0.3em 0.5em; }
+.cs-analytics td.an-num { text-align: right; white-space: nowrap; }
+.cs-analytics .an-bar { display: flex; width: 12em; height: 0.9em; border-radius: 3px; overflow: hidden; background: #eee; }
+.cs-analytics .an-bar span { display: block; height: 100%; }
+.cs-analytics .an-done { background: #2e9e44; }
+.cs-analytics .an-prog { background: #e0a800; }
+.cs-analytics .an-none { background: #ccc; }
+.cs-analytics .an-hist { display: flex; align-items: flex-end; gap: 1px; height: 2em; width: 10em; }
+.cs-analytics .an-hist span { flex: 1; background: #4a74c9; min-height: 1px; }
+.cs-analytics .an-legend span { display: inline-block; width: 0.8em; height: 0.8em; margin: 0 0.3em 0 1em; vertical-align: middle; }
+.cs-analytics .an-risk { color: #c62828; font-weight: bold; }
+.cs-analytics .an-muted { opacity: 0.6; }
+.cs-analytics .an-prog-text { color: #b07d00; font-weight: bold; }
+.cs-analytics details { margin: 0.5em 0; }
+.cs-analytics summary { cursor: pointer; }
+</style>
+"""
+
+
+def _pct(x, digits=0):
+    return "&mdash;" if x is None else "%.*f%%" % (digits, 100 * x)
+
+
+def _score_cell(x):
+    if x is None:
+        return '<td class="an-num an-muted" title="not started or not yet graded">&mdash;</td>'
+    hue = int(120 * max(0.0, min(1.0, x)))
+    return (
+        '<td class="an-num" style="background-color: hsla(%d, 70%%, 50%%, 0.25);">%s</td>'
+        % (
+            hue,
+            _pct(x),
+        )
+    )
+
+
+def _ordered_assignments(data):
+    # group assignments by category, keeping page order within each category
+    order = {c["name"]: i for i, c in enumerate(data["categories"])}
+    return sorted(data["assignments"], key=lambda a: order[a["category"]])
+
+
+def _analytics_csv(context, data):
+    out = io.StringIO()
+    writer = csv.writer(out)
+    assignments = _ordered_assignments(data)
+    categories = [c["name"] for c in data["categories"]]
+    writer.writerow(
+        ["username", "name", "section", "overall"]
+        + ["%s (category)" % c for c in categories]
+        + ["%s: %s" % (a["category"], a["title"]) for a in assignments]
+        + ["not_started", "late", "at_risk"]
+    )
+
+    def _num(x):
+        return "" if x is None else round(x, 4)
+
+    for s in data["students"]:
+        writer.writerow(
+            [s["username"], s["name"], s["section"], _num(s["overall"])]
+            + [_num(s["categories"].get(c)) for c in categories]
+            + [_num(s["scores"][a["key"]]) for a in assignments]
+            + [s["n_not_started"], s["n_late"], s["at_risk"]]
+        )
+    fname = "%s_analytics.csv" % context["cs_course"]
+    return (
+        ("200", "OK"),
+        {
+            "Content-type": "text/csv; charset=utf-8",
+            "Content-Disposition": 'attachment; filename="%s"' % fname,
+        },
+        out.getvalue(),
+    )
+
+
+def _assignment_status(a):
+    if not a["released"]:
+        return '<small class="an-muted">not released</small>'
+    if not a["counted"]:
+        return '<small class="an-prog-text">open</small>'
+    return '<small class="an-muted">closed</small>'
+
+
+def _due_text(a):
+    return a["due"].strftime("%b %d, %H:%M") if a["has_due"] else "&mdash;"
+
+
+def handle_analytics(context):
+    perms = context[_n("perms")]
+    if "whdw" not in perms:
+        return "You are not allowed to view this page."
+
+    form = context["cs_form"]
+    section = form.get("section", "all")
+    section = None if section in ("", "all") else str(section)
+    course = context["cs_course"]
+
+    data = context["csm_analytics"].course_analytics(
+        context, course, context[_n("real_uname")], section
+    )
+
+    if form.get("format", None) == "csv":
+        return _analytics_csv(context, data)
+
+    context["cs_content_header"] = "Course Analytics"
+    esc = html.escape
+    sec_q = "&section=%s" % urllib.parse.quote(section or "all")
+    ov = data["overview"]
+    assignments = _ordered_assignments(data)
+    categories = data["categories"]
+    out = [ANALYTICS_CSS, '<div class="cs-analytics">']
+
+    # controls: section filter and CSV export
+    options = ['<option value="all">All sections</option>'] + [
+        '<option value="%s"%s>Section %s</option>'
+        % (esc(s), " selected" if s == section else "", esc(s))
+        for s in data["sections"]
+    ]
+    out.append(
+        '<div class="an-controls">'
+        '<form method="get"><input type="hidden" name="action" value="analytics"/>'
+        '<label>Section: <select name="section">%s</select></label> '
+        '<button type="submit">Apply</button></form>'
+        '<a href="?action=analytics&amp;format=csv%s">Download CSV</a>'
+        "</div>" % ("".join(options), esc(sec_q))
+    )
+
+    if data["errors"]:
+        out.append(
+            '<div class="callout callout-warning"><b>%d page(s) could not be loaded'
+            " and were skipped:</b> %s</div>"
+            % (
+                len(data["errors"]),
+                ", ".join("<code>%s</code>" % esc(k) for k, _ in data["errors"]),
+            )
+        )
+
+    # overview cards
+    cards = [
+        ("Students", str(ov["n_students"])),
+        (
+            "Assignments (counted)",
+            "%d (%d)" % (ov["n_assignments"], ov["n_counted"]),
+        ),
+        ("Course average", _pct(ov["course_avg"], 1)),
+        ("Completion rate", _pct(ov["completion_rate"], 1)),
+        ("Submitted late (closed work)", _pct(ov["late_rate"], 1)),
+        (
+            "At-risk students",
+            str(sum(s["at_risk"] for s in data["students"])),
+        ),
+    ]
+    out.append('<div class="an-cards">')
+    for label, value in cards:
+        out.append(
+            '<div class="an-card"><div class="an-label">%s</div>'
+            '<div class="an-value">%s</div></div>' % (label, value)
+        )
+    out.append("</div>")
+
+    if not assignments:
+        out.append("<p>No pages with graded questions were found in this course.</p>")
+        out.append("</div>")
+        return "\n".join(out)
+
+    # grading categories
+    out.append("<h2>Grading categories</h2>")
+    if data["weighted"]:
+        out.append(
+            "<p>Each category's share of a student's overall score. Within a"
+            " category, every assignment counts equally.</p>"
+        )
+    else:
+        out.append(
+            "<p>No category weights are configured, so overall scores are points"
+            " earned out of points available. Set"
+            " <code>cs_analytics_category_weights</code> in the course"
+            " <code>preload.py</code> to weight categories, and"
+            " <code>cs_assignment_category</code> in a page's (or folder's)"
+            " <code>preload.py</code> to assign its category.</p>"
+        )
+    out.append(
+        '<div class="an-scroll"><table><tr><th>Category</th><th>Weight</th>'
+        "<th>Assignments (counted)</th><th>Class average</th></tr>"
+    )
+    for c in categories:
+        if c["weight"] is None:
+            weight = "&mdash;"
+        elif c["weight"] == 0:
+            weight = '<span class="an-muted">not weighted</span>'
+        else:
+            weight = _pct(c["weight"], 1)
+        out.append(
+            '<tr><td>%s</td><td class="an-num">%s</td><td class="an-num">%d (%d)'
+            "</td>%s</tr>"
+            % (
+                esc(c["name"]),
+                weight,
+                c["n_assignments"],
+                c["n_counted"],
+                _score_cell(c["avg"]),
+            )
+        )
+    out.append("</table></div>")
+
+    # assignments overview
+    out.append("<h2>Assignments</h2>")
+    out.append(
+        '<p class="an-legend">Only <i>closed</i> assignments (released and past'
+        " their due date, or without one) count toward overall scores. Averages"
+        " and distributions include only students who started the assignment."
+        ' <span class="an-done"></span>submitted every question'
+        '<span class="an-prog"></span>submitted some'
+        '<span class="an-none"></span>not started</p>'
+    )
+    out.append(
+        '<div class="an-scroll"><table><tr><th>Category</th><th>Assignment</th>'
+        "<th>Due</th><th>Average</th><th>Median</th><th>Progress</th>"
+        "<th>Late</th><th>Score distribution</th></tr>"
+    )
+    for a in assignments:
+        c = a["counts"]
+        total = sum(c.values()) or 1
+        bar = "".join(
+            '<span class="%s" style="width: %.2f%%;"></span>'
+            % (cls, 100 * c[k] / total)
+            for k, cls in (
+                ("completed", "an-done"),
+                ("in_progress", "an-prog"),
+                ("not_started", "an-none"),
+            )
+        )
+        peak = max(a["histogram"]) or 1
+        hist = "".join(
+            '<span style="height: %.1f%%;" title="%d%%&ndash;%d%%: %d"></span>'
+            % (100 * h / peak, 10 * i, 10 * (i + 1), h)
+            for i, h in enumerate(a["histogram"])
+        )
+        started = c["completed"] + c["in_progress"]
+        out.append(
+            '<tr><td>%s</td><td><a href="COURSE/%s">%s</a> %s</td>'
+            '<td class="an-num">%s</td>'
+            '<td class="an-num">%s</td><td class="an-num">%s</td>'
+            '<td><div class="an-bar" title="%d submitted every question, %d submitted some, %d not started">%s</div>'
+            "<small>%d / %d / %d</small></td>"
+            '<td class="an-num" title="students with a submission after the due date">%s</td>'
+            '<td><div class="an-hist">%s</div></td></tr>'
+            % (
+                esc(a["category"]),
+                esc(a["key"]),
+                esc(a["title"]),
+                _assignment_status(a),
+                _due_text(a),
+                _pct(a["avg"], 1),
+                _pct(a["median"], 1),
+                c["completed"],
+                c["in_progress"],
+                c["not_started"],
+                bar,
+                c["completed"],
+                c["in_progress"],
+                c["not_started"],
+                (
+                    "%d / %d" % (a["late"], started)
+                    if a["has_due"] and a["counted"] and started
+                    else "&mdash;"
+                ),
+                hist,
+            )
+        )
+    out.append("</table></div>")
+
+    # per-question drill-down
+    def _question_rows(qs, show_assignment=False):
+        rows = ["<table><tr>"]
+        if show_assignment:
+            rows.append("<th>Assignment</th>")
+        rows.append(
+            "<th>Question</th><th>Points</th><th>Attempted</th><th>Avg score</th>"
+            "<th>Perfect</th><th>Avg submissions</th></tr>"
+        )
+        for q in qs:
+            rows.append("<tr>")
+            if show_assignment:
+                rows.append("<td>%s</td>" % esc(q["assignment_title"]))
+            rows.append(
+                '<td><a href="COURSE/%s?action=whdw&amp;question=%s%s">%s</a></td>'
+                '<td class="an-num">%g</td><td class="an-num">%d (%s)</td>%s'
+                '<td class="an-num">%s</td><td class="an-num">%s</td></tr>'
+                % (
+                    esc(q["assignment"]),
+                    esc(urllib.parse.quote(q["name"])),
+                    esc(sec_q),
+                    esc(str(q["display_name"])),
+                    q["npoints"],
+                    q["attempted"],
+                    _pct(q["attempted_pct"]),
+                    _score_cell(q["avg_score"]),
+                    _pct(q["perfect_pct"]),
+                    (
+                        "&mdash;"
+                        if q["avg_submissions"] is None
+                        else "%.1f" % q["avg_submissions"]
+                    ),
+                )
+            )
+        rows.append("</table>")
+        return "".join(rows)
+
+    if data["hardest"]:
+        out.append("<h2>Hardest questions</h2>")
+        out.append(
+            "<p>Questions from closed assignments with the lowest average score"
+            " among students who attempted them (at least %d graded attempts).</p>"
+            % min(context["csm_analytics"].HARDEST_MIN_GRADED, ov["n_students"] or 1)
+        )
+        out.append(
+            '<div class="an-scroll">%s</div>' % _question_rows(data["hardest"], True)
+        )
+
+    out.append("<h2>Questions by assignment</h2>")
+    for a in assignments:
+        out.append(
+            "<details><summary><b>%s</b> &middot; %s (%d questions, %g points)"
+            '</summary><div class="an-scroll">%s</div></details>'
+            % (
+                esc(a["title"]),
+                esc(a["category"]),
+                len(a["question_stats"]),
+                a["total_points"],
+                _question_rows(a["question_stats"]),
+            )
+        )
+
+    # students
+    out.append("<h2>Students</h2>")
+    out.append(
+        "<p>Category averages and overall scores count closed assignments only,"
+        " with unstarted work counted as zero and work awaiting a grade left"
+        " out until it is graded. Students below %s overall are"
+        " flagged as at-risk; lowest scores are listed first.</p>"
+        % _pct(data["threshold"])
+    )
+    students = sorted(
+        data["students"],
+        key=lambda s: (s["overall"] is None, s["overall"] or 0, s["username"]),
+    )
+    out.append(
+        '<div class="an-scroll"><table><tr><th rowspan="2">Student</th>'
+        '<th rowspan="2">Section</th><th rowspan="2">Overall</th>'
+        '<th colspan="%d">Category averages</th>'
+        '<th rowspan="2">Not started</th><th rowspan="2">Late</th>' % len(categories)
+    )
+    for c in categories:
+        n = sum(a["category"] == c["name"] for a in assignments)
+        out.append('<th colspan="%d">%s</th>' % (n, esc(c["name"])))
+    out.append("</tr><tr>")
+    for c in categories:
+        out.append("<th>%s</th>" % esc(c["name"]))
+    for a in assignments:
+        out.append("<th>%s</th>" % esc(a["title"]))
+    out.append("</tr>")
+    for s in students:
+        name = esc(s["name"])
+        if s["name"] != s["username"]:
+            name += ' (<a href="COURSE?as=%s" target="_blank">%s</a>)' % (
+                esc(urllib.parse.quote(s["username"])),
+                esc(s["username"]),
+            )
+        flag = (
+            ' <span class="an-risk" title="at-risk">&#9888;</span>'
+            if s["at_risk"]
+            else ""
+        )
+        out.append(
+            "<tr><td>%s%s</td><td>%s</td>%s"
+            % (name, flag, esc(s["section"]), _score_cell(s["overall"]))
+        )
+        for c in categories:
+            out.append(_score_cell(s["categories"].get(c["name"])))
+        out.append(
+            '<td class="an-num">%d</td><td class="an-num">%d</td>'
+            % (s["n_not_started"], s["n_late"])
+        )
+        for a in assignments:
+            out.append(_score_cell(s["scores"][a["key"]]))
+        out.append("</tr>")
+    out.append("</table></div>")
+    out.append("</div>")
+    return "\n".join(out)
+
+
 def _real_name(context, username):
     return (
         context["csm_cslog"].most_recent("_extra_info", [], username, None) or {}
@@ -2534,7 +2942,7 @@ def handle_whdw(context):
 
     section = str(
         context.get("cs_form", {}).get(
-            "section", context.get("cs_user_info").get("section", "default")
+            "section", context.get("cs_user_info").get("section", "all")
         )
     )
 

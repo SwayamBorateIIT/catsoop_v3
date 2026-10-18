@@ -302,7 +302,7 @@ def compute_page_stats(context, user, path, keys=None):
             qi = out["question_info"][n] = {}
             qi["csq_name"] = n
             qi["csq_npoints"] = q["total_points"](**a)
-            qi["csq_display_name"] = a.get("csq_display_name", "csq_name")
+            qi["csq_display_name"] = a.get("csq_display_name", n)
             qi["qtype"] = q["qtype"]
             qi["csq_grading_mode"] = a.get("csq_grading_mode", "auto")
             qi["csq_prompt"] = a.get("csq_prompt", None)
